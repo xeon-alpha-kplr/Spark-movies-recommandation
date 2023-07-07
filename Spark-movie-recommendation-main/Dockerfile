@@ -1,25 +1,27 @@
-# Utilisez une image de base contenant Python
-FROM python:3.9-slim
-
-# Définissez le répertoire de travail dans le conteneur
+FROM apache/spark:3.4.0
+ 
+# Install any additional dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip
+ 
+ 
+# Set the working directory
 WORKDIR /app
-
-# Copiez le fichier requirements.txt dans le conteneur
-COPY requirements.txt .
-
-# Installez les dépendances requises
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copiez le reste des fichiers de votre application dans le conteneur
-COPY . .
-
-# Exposez le port sur lequel Flask sera exécuté
-EXPOSE 5000
-
-# Démarrez l'application Flask
+ 
+# Copy the Spark project files to the container
+COPY ./app /app
+ 
+COPY ./requirements.txt /app
+ 
+COPY ./app/ml-latest /ml-latest
+ 
+# Install Python dependencies
+RUN pip3 install -r requirements.txt
+# RUN sed -i "s/localhost/$(curl http://checkip.amazonaws.com)/g" static/index.js
+ 
+# Expose the port for the web application
+EXPOSE 5432
+ 
+# Set the entry point
 CMD ["spark-submit", "server.py", "ml-latest/movies.csv", "ml-latest/ratings.csv"]
-
-
-
-
-

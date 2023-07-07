@@ -1,124 +1,172 @@
 from pyspark.sql.types import *
 from pyspark.sql.functions import explode, col
+ 
 from pyspark.ml.recommendation import ALS
 from pyspark.ml.evaluation import RegressionEvaluator
+ 
 from pyspark.sql import SQLContext
-
+ 
+import random
+ 
 class RecommendationEngine:
-    def __init__(self, sc, "/workspaces/Spark-movies-recommandation/Spark-movie-recommendation-main/app/ml-latest/movies.csv", "Spark-movie-recommendation-main/app/ml-latest/ratings.csv"):
-        self.spark = SparkSession(sc)
-        self.spark.conf.set("spark.sql.shuffle.partitions", "4")
-        
-        self.load_movies("/workspaces/Spark-movies-recommandation/Spark-movie-recommendation-main/app/ml-latest/movies.csv")
-        self.load_ratings("Spark-movie-recommendation-main/app/ml-latest/ratings.csv")
-        
-        self.max_user_identifier = self.ratings_df.select(F.max("userId")).first()[0]
-        if self.max_user_identifier is None:
-            self.max_user_identifier = 0
-        
-        self.__train_model()
-    
-    def load_movies(self, "/workspaces/Spark-movies-recommandation/Spark-movie-recommendation-main/app/ml-latest/movies.csv"):
-        movies_schema = StructType([
-            StructField("movieId", IntegerType(), True),
-            StructField("title", StringType(), True),
-            # Include other relevant fields
-        ])
-        
-        self.movies_df = self.spark.read.csv("/workspaces/Spark-movies-recommandation/Spark-movie-recommendation-main/app/ml-latest/movies.csv", header=True, schema=movies_schema)
-    
-    def load_ratings(self, "Spark-movie-recommendation-main/app/ml-latest/ratings.csv"):
-        ratings_schema = StructType([
-            StructField("userId", IntegerType(), True),
-            StructField("movieId", IntegerType(), True),
-            StructField("rating", DoubleType(), True),
-            # Include other relevant fields
-        ])
-        
-        self.ratings_df = self.spark.read.csv("Spark-movie-recommendation-main/app/ml-latest/ratings.csv", header=True, schema=ratings_schema)
-    
-    def create_user(self, user_id=None):
-        if user_id is None:
-            user_id = self.max_user_identifier + 1
-            self.max_user_identifier += 1
-        
-        return user_id
-    
+ 
+    """
+        Create new User.
+    """
+    def create_user(self, user_id):
+        if user_id == None:
+            self.max_user_identifier = self.max_user_identifier + 1
+        elif user_id > self.max_user_identifier:
+            self.max_user_identifier = user_id
+        return self.max_user_identifier
+ 
+    """
+        Check is a user known.
+    """
     def is_user_known(self, user_id):
-        return user_id is not None and user_id <= self.max_user_identifier
-    
-    def get_movie(self, movie_id=None):
-        if movie_id is None:
-            sample_movie = self.movies_df.sample(0.1).limit(1)
-            return sample_movie.select("movieId", "title")
+        return user_id != None and user_id <= self.max_user_identifier
+ 
+    """
+        Get a movie.
+    """
+    def get_movie(self, movie_id):
+        if movie_id == None:
+            best_movies_struct = [StructField("movieId", IntegerType(), True),
+                        StructField("title", StringType(), True),
+                        StructField("count", IntegerType(), True)]
+            best_movies_df = self.spark.createDataFrame(self.most_rated_movies, StructType(best_movies_struct))
+            return best_movies_df.sample(False, fraction=0.05).select("movieId", "title").limit(1)
         else:
-            return self.movies_df.filter(F.col("movieId") == movie_id).select("movieId", "title")
-    
+            return self.movies_df.filter("movieId == " + str(movie_id))
+ 
+    """
+        Get ratings for user.
+    """
     def get_ratings_for_user(self, user_id):
-        return self.ratings_df.filter(F.col("userId") == user_id).select("movieId", "userId", "rating")
-    
+        return self.ratings_df.filter("userId == " + str(user_id))
+ 
+    """
+        Adds new ratings to the model dataset and train the model again.
+    """
     def add_ratings(self, user_id, ratings):
-        new_ratings_df = self.spark.createDataFrame(ratings, self.ratings_df.schema)
+        rating_struct = [StructField("movieId", IntegerType(), True),
+            StructField("userId", IntegerType(), True),
+            StructField("rating", DoubleType(), True)]
+        
+        ratings_list = list(ratings)
+        print("Add {} new ratings to train the model".format(len(ratings_list)))
+ 
+        new_ratings_df = self.spark.createDataFrame(ratings_list, StructType(rating_struct))
         self.ratings_df = self.ratings_df.union(new_ratings_df)
-        
-        train_df, test_df = self.ratings_df.randomSplit([0.8, 0.2])
-        self.training = train_df.cache()
-        self.test = test_df.cache()
-        
+ 
+        # Splitting training data
+        self.training, self.test = self.ratings_df.randomSplit([0.8, 0.2], seed=12345)
         self.__train_model()
-    
+ 
+    """
+        Given a user_id and a movie_id, predict ratings for it.
+    """
     def predict_rating(self, user_id, movie_id):
-        rating_df = self.spark.createDataFrame([(user_id, movie_id)], ["userId", "movieId"])
-        predictions = self.model.transform(rating_df).select("prediction").collect()
-        
-        if len(predictions) == 0:
+        data = [(user_id, movie_id)]
+ 
+        rating_struct = [StructField("userId", IntegerType(), True),
+            StructField("movieId", IntegerType(), True)]
+        rating_df = self.spark.createDataFrame(data, StructType(rating_struct))
+ 
+        prediciton_df = self.model.transform(rating_df)
+        if (prediciton_df.count() == 0):
             return -1
-        else:
-            return predictions[0][0]
-    
+        return prediciton_df.collect()[0].asDict()["prediction"]
+ 
+    """
+        Returns the top recommendations for a given user.
+    """
     def recommend_for_user(self, user_id, nb_movies):
-        user_df = self.spark.createDataFrame([(user_id,)], ["userId"])
-        recommendations = self.model.recommendForUserSubset(user_df, nb_movies).select("recommendations.movieId")
-        movie_ids = [r[0] for r in recommendations.collect()]
-        
-        recommended_movies = self.movies_df.filter(F.col("movieId").isin(movie_ids))
-        
-        return recommended_movies.select("title", "genre") 
-    
+        user_df = self.spark.createDataFrame([user_id], IntegerType()).withColumnRenamed("value", "userId")
+        ratings = self.model.recommendForUserSubset(user_df, nb_movies)
+        user_recommandations = ratings.select(
+             explode(col("recommendations").movieId).alias("movieId")
+        )
+        return user_recommandations.join(self.movies_df, "movieId").drop("genres").drop("movieId")
+ 
+    """
+        Train the model with ALS.
+    """
     def __train_model(self):
-        als = ALS(maxIter=10, regParam=0.1, userCol="userId", itemCol="movieId", ratingCol="rating",
+        als = ALS(maxIter=self.max_iter,
+                  regParam=self.reg_param, \
+                  implicitPrefs=False, \
+                  userCol="userId", \
+                  itemCol="movieId", \
+                  ratingCol="rating", \
                   coldStartStrategy="drop")
+ 
         self.model = als.fit(self.training)
         self.__evaluate()
-
+ 
+    """
+        Evaluate the model by calculating the Root-mean-square error.
+    """
     def __evaluate(self):
         predictions = self.model.transform(self.test)
         evaluator = RegressionEvaluator(metricName="rmse", labelCol="rating", predictionCol="prediction")
         self.rmse = evaluator.evaluate(predictions)
-        print(f"Root Mean Squared Error (RMSE): {self.rmse}")
-
-    def __init__(self, sc, "/workspaces/Spark-movies-recommandation/Spark-movie-recommendation-main/app/ml-latest/movies.csv", "Spark-movie-recommendation-main/app/ml-latest/ratings.csv"):
-        self.spark = SparkSession(sc)
-        self.spark.conf.set("spark.sql.shuffle.partitions", "4")
-
-        self.load_movies("/workspaces/Spark-movies-recommandation/Spark-movie-recommendation-main/app/ml-latest/movies.csv")
-        self.load_ratings("Spark-movie-recommendation-main/app/ml-latest/ratings.csv")
-
-        self.max_user_identifier = self.ratings_df.select(F.max("userId")).first()[0]
-        if self.max_user_identifier is None:
-            self.max_user_identifier = 0
-
-        self.training, self.test = self.ratings_df.randomSplit([0.8, 0.2])
+        print("Root-mean-square error = " + str(self.rmse))
+ 
+    """
+        Load datasets and train the model.
+    """
+    def __init__(self, sc, movies_set_path, ratings_set_path):
+        self.spark = SQLContext(sc).sparkSession
+        
+        # Get hyper parameters from command line
+        self.max_iter = 9
+        self.reg_param = 0.05
+ 
+        print("MaxIter {}, RegParam {}.".format(self.max_iter, self.reg_param))
+ 
+        # Define schema for movies dataset
+        movies_struct = [StructField("movieId", IntegerType(), True),
+            StructField("title", StringType(), True),
+            StructField("genres", StringType(), True)]
+ 
+        movies_schema = StructType(movies_struct)
+ 
+        # Define schema for ratings dataset
+        ratings_struct = [StructField("userId", IntegerType(), True),
+        StructField("movieId", IntegerType(), True),
+        StructField("rating", DoubleType(), True),
+        StructField("timestamp", IntegerType(), True)]
+ 
+        ratings_schema = StructType(ratings_struct)
+ 
+        # Read movies from Local File System
+        self.movies_df = self.spark.read.format("csv") \
+            .option("header", "true") \
+            .option("delimiter", ",") \
+            .schema(movies_schema) \
+            .load('file:///'+movies_set_path)
+ 
+        self.movies_count = self.movies_df.count()
+        print("Number of movies : {}.".format(self.movies_count))
+ 
+        # Read ratings from Local File System
+        self.ratings_df = self.spark.read.format("csv") \
+            .option("header", "true") \
+            .option("delimiter", ",") \
+            .schema(ratings_schema) \
+            .load('file:///'+ratings_set_path) \
+            .drop("timestamp")
+ 
+        self.max_user_identifier = self.ratings_df.select('userId').distinct().sort(col("userId").desc()).limit(1).take(1)[0].userId
+        print("Max user id : {}.".format(self.max_user_identifier))
+ 
+        self.most_rated_movies = self.movies_df \
+            .join(self.ratings_df, "movieId") \
+            .groupBy(col("movieId"), col("title")).count().orderBy("count", ascending=False) \
+            .limit(200).collect()
+ 
+        # Splitting training data
+        self.training, self.test = self.ratings_df.randomSplit([0.8, 0.2], seed=12345)
+ 
         self.__train_model()
-
-# Création d'une instance de la classe RecommendationEngine
-engine = RecommendationEngine(sc, "/workspaces/Spark-movies-recommandation/Spark-movie-recommendation-main/app/ml-latest/movies.csv", "/workspaces/Spark-movies-recommandation/Spark-movie-recommendation-main/app/ml-latest/ratings.csv")
-
-# Exemple d'utilisation des méthodes de la classe RecommendationEngine
-user_id = engine.create_user(None)
-if engine.is_user_known(user_id):
-    movie = engine.get_movie(None)
-    ratings = engine.get_ratings_for_user(user_id)
-    engine.add_ratings(user_id, ratings)
-    prediction = engine.predict_rating(user_id, movie.movieId)
-    recommendations = engine.recommend_for_user(user_id, 10)
